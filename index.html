@@ -2367,6 +2367,18 @@ function openDel(id){
 }
 function doDelete(id){
   tenders = tenders.filter(function(x){ return x.id!==id; });
+  // Track deletion with timestamp so merge knows not to bring it back
+  try{
+    const deleted = JSON.parse(localStorage.getItem('tt_deleted')||'{}');
+    deleted[id] = Date.now();
+    // Keep only last 200 deletions to avoid bloat
+    const keys = Object.keys(deleted);
+    if(keys.length > 200){
+      keys.sort(function(a,b){ return deleted[a]-deleted[b]; });
+      keys.slice(0, keys.length-200).forEach(function(k){ delete deleted[k]; });
+    }
+    localStorage.setItem('tt_deleted', JSON.stringify(deleted));
+  } catch(e){}
   save(); render(); closeM('modal-del'); toast('Deleted');
   schedulePush();
 }
@@ -2531,7 +2543,7 @@ async function syncPush(silent){
     setSyncDot('busy');
     try{
       const files = {};
-      files[SYNC_FILE] = { content: JSON.stringify({ tenders: buildSlim(), people: getPeople() }) };
+      files[SYNC_FILE] = { content: JSON.stringify({ tenders: buildSlim(), people: getPeople(), deleted: JSON.parse(localStorage.getItem('tt_deleted')||'{}') }) };
       const res = await gistReq('POST', '/gists', {
         description: 'TenderTrack data — do not edit manually',
         public: false, files: files
@@ -2555,7 +2567,7 @@ async function syncPush(silent){
     // 1. Fetch current remote
     const res  = await gistReq('GET', '/gists/' + cfg.gistId);
     const file = res.files && res.files[SYNC_FILE];
-    let remoteTenders = [], remotePeople = [];
+    let remoteTenders = [], remotePeople = [], remoteDeleted = {};
     if(file){
       let raw = file.content;
       if(file.truncated){ const r = await fetch(file.raw_url); raw = await r.text(); }
@@ -2565,12 +2577,17 @@ async function syncPush(silent){
       } else if(parsed && Array.isArray(parsed.tenders)){
         remoteTenders = parsed.tenders.map(expandSlim);
         remotePeople  = parsed.people || [];
+        remoteDeleted = parsed.deleted || {};
       }
     }
 
-    // 2. Merge tenders
-    // For tenders with no updatedAt, derive a timestamp from stageEnteredAt
-    // (most recent stage entry = proxy for last modification)
+    // 2. Merge tenders — respecting deletions from both sides
+    // Combine deleted maps: local + remote
+    const localDeleted = JSON.parse(localStorage.getItem('tt_deleted')||'{}');
+    const allDeleted = Object.assign({}, remoteDeleted, localDeleted);
+    // Save merged deletions locally
+    localStorage.setItem('tt_deleted', JSON.stringify(allDeleted));
+
     function getEffectiveTime(t){
       if(t.updatedAt && t.updatedAt > 0) return t.updatedAt;
       const sea = t.stageEnteredAt || {};
@@ -2578,27 +2595,23 @@ async function syncPush(silent){
       return times.length ? Math.max.apply(null, times) : 0;
     }
 
-    const lastSync = parseInt(localStorage.getItem('tt_last_sync') || '0');
     const mergedMap = {};
 
-    // Start with remote
-    remoteTenders.forEach(function(t){ mergedMap[t.id] = t; });
+    // Start with remote (excluding anything in allDeleted)
+    remoteTenders.forEach(function(t){
+      if(!allDeleted[t.id]) mergedMap[t.id] = t;
+    });
 
-    // Override with local ONLY if local is strictly newer than remote
-    // If same age: prefer remote (it may have been updated by someone else since last sync)
+    // Override/add local tenders (excluding deleted)
     tenders.forEach(function(t){
+      if(allDeleted[t.id]) return; // skip deleted
       const remote = mergedMap[t.id];
       if(!remote){
-        // New local tender not on remote — keep it
-        mergedMap[t.id] = t;
+        mergedMap[t.id] = t; // new local tender
       } else {
         const localTime  = getEffectiveTime(t);
         const remoteTime = getEffectiveTime(remote);
-        if(localTime > remoteTime){
-          // Local is strictly newer — local wins
-          mergedMap[t.id] = t;
-        }
-        // Otherwise remote wins (either remote is newer, or both are 0 — trust remote)
+        if(localTime > remoteTime) mergedMap[t.id] = t; // local is newer
       }
     });
 
@@ -2621,7 +2634,7 @@ async function syncPush(silent){
 
     // 5. Write merged data back to Gist
     const files = {};
-    files[SYNC_FILE] = { content: JSON.stringify({ tenders: buildSlim(), people: mergedPeople }) };
+    files[SYNC_FILE] = { content: JSON.stringify({ tenders: buildSlim(), people: mergedPeople, deleted: allDeleted }) };
     await gistReq('PATCH', '/gists/' + cfg.gistId, { files: files });
 
     localStorage.setItem('tt_last_sync', Date.now().toString());
@@ -2649,28 +2662,34 @@ async function syncPull(silent){
       raw = await r.text();
     }
     const parsed = JSON.parse(raw);
-    // Support both new format {tenders, people} and old array format
-    let arr, peopleArr;
+    let arr, peopleArr, remoteDeleted2 = {};
     if(Array.isArray(parsed)){
       arr = parsed; peopleArr = null;
     } else if(parsed && Array.isArray(parsed.tenders)){
       arr = parsed.tenders; peopleArr = parsed.people || null;
+      remoteDeleted2 = parsed.deleted || {};
     } else {
       throw new Error('Invalid data format in Gist');
     }
-    if(arr.length > 0 || peopleArr){
-      if(arr.length > 0){
-        tenders = arr.map(expandSlim);
+    // Merge deleted maps and filter
+    const localDel = JSON.parse(localStorage.getItem('tt_deleted')||'{}');
+    const mergedDel = Object.assign({}, localDel, remoteDeleted2);
+    localStorage.setItem('tt_deleted', JSON.stringify(mergedDel));
+    // Filter out deleted tenders from pull
+    const filteredArr = arr.filter(function(t){ return !mergedDel[t.id]; });
+
+    if(filteredArr.length > 0 || peopleArr){
+      if(filteredArr.length > 0 || arr.length > 0){
+        tenders = filteredArr.map(expandSlim);
         save();
       }
-      // Merge people — keep local people, add/update from remote (roles may have changed)
       if(peopleArr && peopleArr.length > 0){
         savePeople(peopleArr);
       }
       render();
       localStorage.setItem('tt_last_sync', Date.now().toString());
       setSyncDot('ok');
-      if(!silent) toast('Pulled ' + arr.length + ' tenders ✓');
+      if(!silent) toast('Pulled ' + filteredArr.length + ' tenders ✓');
     } else {
       setSyncDot('ok');
       if(!silent) toast('Gist is empty — Push from your main device first');
@@ -2718,7 +2737,7 @@ async function syncForcePull(){
 
 // ── Export / Import ───────────────────────────────────
 function exportData(){
-  const payload = { tenders: buildSlim(), people: getPeople() };
+  const payload = { tenders: buildSlim(), people: getPeople(), deleted: JSON.parse(localStorage.getItem('tt_deleted')||'{}') };
   const data = JSON.stringify(payload, null, 2);
   const blob = new Blob([data], {type:'application/json'});
   const url  = URL.createObjectURL(blob);
