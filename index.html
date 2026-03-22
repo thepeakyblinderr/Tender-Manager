@@ -189,6 +189,7 @@ header{position:sticky;top:0;z-index:50;
 .sync-dot.ok{background:#34d399;box-shadow:0 0 6px #34d39977;}
 .sync-dot.err{background:#f87171;box-shadow:0 0 6px #f8717177;}
 .sync-dot.busy{background:#fbbf24;box-shadow:0 0 6px #fbbf2477;animation:pulse .8s infinite;}
+.sync-dot.pending{background:#fb923c;box-shadow:0 0 4px #fb923c66;animation:pulse 1.5s infinite;}
 .btn-sync{display:flex;align-items:center;gap:5px;background:var(--surface);border:1px solid var(--border2);
   border-radius:9px;padding:7px 11px;color:var(--dim);font-family:var(--sans);font-size:12px;font-weight:500;
   cursor:pointer;white-space:nowrap;flex-shrink:0;-webkit-appearance:none;transition:border-color .15s,background .2s;}
@@ -1420,6 +1421,8 @@ function assignPerson(pid){
     }
   }
 
+  const _atd = tenders.find(function(x){ return x.id===_assignTid; });
+  if(_atd) _atd.updatedAt = Date.now();
   save(); render();
   closeM('modal-assign');
   const det = document.getElementById('modal-detail');
@@ -2042,6 +2045,7 @@ function openDetail(id){
       const tender = tenders.find(function(x){ return x.id===id; });
       if(!tender) return;
       tender.owner = (val === '__none__') ? '' : val;
+      tender.updatedAt = Date.now();
       save(); render(); schedulePush();
       const newOwner = tender.owner ? personById(tender.owner) : null;
       toast(newOwner ? 'Owner set to ' + newOwner.name + ' ✓' : 'Owner removed');
@@ -2252,6 +2256,7 @@ function removeStage(id, sid){
   if(!t) return;
   t.stages = t.stages.filter(function(s){ return s!==sid; });
   if(t.stageEnteredAt) delete t.stageEnteredAt[sid];
+  t.updatedAt = Date.now();
   // NOTE: deliberately preserve stageAssigned[sid] and stageAssignHistory[sid]
   // so assignment history survives stage removal
   save(); render(); buildChips(t); toast('Stage removed');
@@ -2310,6 +2315,7 @@ function saveTender(){
     const t = tenders.find(function(x){ return x.id===editId; });
     if(!t) return;
     Object.assign(t, fields);
+    t.updatedAt = Date.now();
     if(!t.stages.includes(sid)){
       t.stages.push(sid);
       if(!t.stageEnteredAt) t.stageEnteredAt = {};
@@ -2330,7 +2336,7 @@ function saveTender(){
       const p = personById(pid);
       return (p && p.role !== 'manager') ? pid : '';
     })();
-    tenders.unshift({id:uid(), stages:[sid], stageEnteredAt:entered, owner:_ownerPid, ...fields});
+    tenders.unshift({id:uid(), stages:[sid], stageEnteredAt:entered, owner:_ownerPid, updatedAt:Date.now(), ...fields});
     toast('Tender added ✓');
   }
   save(); render(); closeM('modal-add');
@@ -2413,7 +2419,8 @@ function setSyncDot(state){
 function buildSlim(){
   return tenders.map(function(t){
     const o = {id:t.id, no:t.no, stages:t.stages};
-    if(t.owner)    o.ow  = t.owner;
+    if(t.owner)     o.ow  = t.owner;
+    if(t.updatedAt) o.ua  = t.updatedAt;
     if(t.stageEnteredAt && Object.keys(t.stageEnteredAt).length) o.sea = t.stageEnteredAt;
     if(t.priority) o.p   = t.priority;
     if(t.isAF)     o.af  = true;
@@ -2435,6 +2442,7 @@ function expandSlim(t){
   return {
     id:t.id, no:t.no,
     owner:              t.ow  || t.owner || '',
+    updatedAt:          t.ua  || t.updatedAt || 0,
     stages:             t.stages || [],
     stageEnteredAt:     t.sea || t.stageEnteredAt || {},
     priority:           t.p   || t.priority || '',
@@ -2476,42 +2484,110 @@ async function gistReq(method, path, body){
 
 // ── Auto-push (debounced) ─────────────────────────────
 // Waits 8s after last change before pushing — so rapid edits batch into one push
+// ── Auto-push (debounced) ─────────────────────────────
 let _pushTimer = null;
 function schedulePush(){
   const cfg = getSyncCfg();
   if(!cfg.token || !cfg.gistId) return; // not configured — skip silently
   clearTimeout(_pushTimer);
-  // Show a subtle "pending" dot so user knows a push is queued
-  setSyncDot('busy');
+  // Show subtle pending indicator — not the spinning busy state
+  const dot = document.getElementById('sync-dot');
+  if(dot) dot.className = 'sync-dot pending';
   _pushTimer = setTimeout(function(){
-    schedulePush();
+    syncPush(true); // silent = no toast on auto-push
   }, 8000);
 }
 
-async function syncPush(){
+async function syncPush(silent){
   const cfg = getSyncCfg();
-  if(!cfg.token){ toast('Set up sync first', true); return; }
-  setSyncDot('busy');
-  try{
-    const payload = { tenders: buildSlim(), people: getPeople() };
-    const files = {};
-    files[SYNC_FILE] = { content: JSON.stringify(payload) };
-    let gistId = cfg.gistId;
-    if(!gistId){
+  if(!cfg.token){ if(!silent) toast('Set up sync first', true); return; }
+
+  // First-time push (no gistId) — just create the Gist
+  if(!cfg.gistId){
+    setSyncDot('busy');
+    try{
+      const files = {};
+      files[SYNC_FILE] = { content: JSON.stringify({ tenders: buildSlim(), people: getPeople() }) };
       const res = await gistReq('POST', '/gists', {
         description: 'TenderTrack data — do not edit manually',
         public: false, files: files
       });
-      gistId = res.id;
-      cfg.gistId = gistId;
+      cfg.gistId = res.id;
       saveSyncCfg(cfg);
-    } else {
-      await gistReq('PATCH', '/gists/' + gistId, { files: files });
+      localStorage.setItem('tt_last_sync', Date.now().toString());
+      setSyncDot('ok');
+      if(!silent) toast('Pushed to Gist ✓');
+    } catch(e){
+      setSyncDot('err');
+      if(!silent) toast('Push failed: ' + e.message, true);
+      console.warn('syncPush:', e);
     }
+    return;
+  }
+
+  // Merge-push: read remote → merge by updatedAt → write back
+  setSyncDot('busy');
+  try{
+    // 1. Fetch current remote
+    const res  = await gistReq('GET', '/gists/' + cfg.gistId);
+    const file = res.files && res.files[SYNC_FILE];
+    let remoteTenders = [], remotePeople = [];
+    if(file){
+      let raw = file.content;
+      if(file.truncated){ const r = await fetch(file.raw_url); raw = await r.text(); }
+      const parsed = JSON.parse(raw);
+      if(Array.isArray(parsed)){
+        remoteTenders = parsed.map(expandSlim);
+      } else if(parsed && Array.isArray(parsed.tenders)){
+        remoteTenders = parsed.tenders.map(expandSlim);
+        remotePeople  = parsed.people || [];
+      }
+    }
+
+    // 2. Merge tenders — winner = highest updatedAt
+    const mergedMap = {};
+    // Add all remote tenders first
+    remoteTenders.forEach(function(t){ mergedMap[t.id] = t; });
+    // Override with local if local is newer or same age (local changes take priority)
+    tenders.forEach(function(t){
+      const remote = mergedMap[t.id];
+      if(!remote || (t.updatedAt || 0) >= (remote.updatedAt || 0)){
+        mergedMap[t.id] = t;
+      }
+    });
+    // Also keep remote-only tenders (added by someone else)
+    // already in mergedMap from step above
+
+    const merged = Object.values(mergedMap);
+    // Sort by most recently updated
+    merged.sort(function(a,b){ return (b.updatedAt||0) - (a.updatedAt||0); });
+
+    // 3. Merge people — combine, remote wins on role conflicts
+    const peopleMap = {};
+    getPeople().forEach(function(p){ peopleMap[p.id] = p; });
+    remotePeople.forEach(function(p){
+      if(!peopleMap[p.id]) peopleMap[p.id] = p; // add remote-only people
+      // If person exists locally keep local (officer knows their own team)
+    });
+    const mergedPeople = Object.values(peopleMap);
+
+    // 4. Update local with merged data
+    tenders = merged;
+    save();
+    savePeople(mergedPeople);
+    render();
+
+    // 5. Write merged data back to Gist
+    const files = {};
+    files[SYNC_FILE] = { content: JSON.stringify({ tenders: buildSlim(), people: mergedPeople }) };
+    await gistReq('PATCH', '/gists/' + cfg.gistId, { files: files });
+
     localStorage.setItem('tt_last_sync', Date.now().toString());
-    setSyncDot('ok'); toast('Pushed to Gist ✓');
+    setSyncDot('ok');
+    if(!silent) toast('Synced ✓');
   } catch(e){
-    setSyncDot('err'); toast('Push failed: ' + e.message, true);
+    setSyncDot('err');
+    if(!silent) toast('Sync failed: ' + e.message, true);
     console.warn('syncPush:', e);
   }
 }
@@ -2837,6 +2913,7 @@ function openSync(){
       if(!t.stageAssignHistory[toSid]) t.stageAssignHistory[toSid] = [];
       t.stageAssignHistory[toSid].push({ pid: prevPid, assignedAt: Date.now(), carriedFrom: fromSid });
     }
+    t.updatedAt = Date.now();
     save(); render();
     var toStage = STAGES.find(function(s){ return s.id === toSid; });
     toast('Moved to ' + (toStage ? toStage.label : 'stage'));
