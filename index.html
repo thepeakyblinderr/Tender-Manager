@@ -2770,17 +2770,19 @@ function openSync(){
         '<span class="sync-dot ok"></span>'+
         '<span>Connected · Last sync: <b>' + lsStr + '</b></span>'+
       '</div>'+
-      (cfg.gistId
-        ? '<p style="font-size:11px;color:var(--dim);font-family:var(--mono);margin-bottom:14px;word-break:break-all">'+
-            'Gist ID: <a href="https://gist.github.com/' + esc(cfg.gistId) + '" target="_blank" style="color:var(--accent)">'+
-            esc(cfg.gistId.slice(0,20)) + '…</a></p>'
-        : '<p style="font-size:12px;color:var(--yellow);margin-bottom:14px;">⚠ No Gist yet — tap Push to create one.</p>'
-      )+
+      // Debug panel — always visible so user can see state
+      '<div style="background:var(--muted);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:10px;font-size:11px;font-family:var(--mono);color:var(--dim);line-height:1.8;">'+
+        'Token: <b style="color:var(--text)">' + esc(cfg.token ? cfg.token.slice(0,12)+'…' : '❌ none') + '</b><br>'+
+        'Gist ID: <b style="color:var(--text)">' + (cfg.gistId ? esc(cfg.gistId.slice(0,16))+'…' : '❌ not found') + '</b><br>'+
+        'Local tenders: <b style="color:var(--text)">' + tenders.length + '</b>'+
+      '</div>'+
       '<div class="sync-acts">'+
-        '<button class="btn-push" id="sp-push">⬆ Push to Gist</button>'+
-        '<button class="btn-pull" id="sp-pull">⬇ Pull from Gist</button>'+
-        '</div>'+
-        '<div style="margin-bottom:12px;">'+
+        '<button class="btn-push" id="sp-push">⬆ Push</button>'+
+        '<button class="btn-pull" id="sp-pull">⬇ Pull</button>'+
+        '<button class="btn-pull" id="sp-test" style="background:var(--card2);color:var(--dim);border:1px solid var(--border2);">🔍 Test</button>'+
+      '</div>'+
+      '<div id="sp-test-result" style="font-size:11px;font-family:var(--mono);min-height:16px;margin-bottom:8px;padding:6px 8px;line-height:1.7;display:none;background:var(--muted);border-radius:7px;border:1px solid var(--border);"></div>'+
+      '<div style="margin-bottom:12px;">'+
         '<button id="sp-force-pull" style="width:100%;padding:9px;border-radius:9px;font-size:12px;font-weight:700;cursor:pointer;font-family:var(--mono);background:var(--card2);color:var(--yellow);border:1px solid rgba(180,83,9,.3);">⚠ Force Pull — replace ALL local data with Gist</button>'+
       '</div>'+
       '<div class="fsec">Export / Import (no account needed)</div>'+
@@ -2844,6 +2846,65 @@ function openSync(){
 
   wire('sp-push',   function(){ closeM('modal-sync'); syncPush(); });
   wire('sp-pull',   function(){ closeM('modal-sync'); syncPull(); });
+
+  wire('sp-test', async function(){
+    const resultEl = document.getElementById('sp-test-result');
+    if(!resultEl) return;
+    resultEl.style.display = 'block';
+    resultEl.style.color = 'var(--dim)';
+    resultEl.textContent = '⏳ Testing...';
+    const cfg = getSyncCfg();
+    const lines = [];
+    try{
+      // Step 1: check token
+      lines.push('1. Token: ' + (cfg.token ? cfg.token.slice(0,12)+'…' : '❌ missing'));
+      if(!cfg.token){ resultEl.innerHTML = lines.join('<br>'); return; }
+
+      // Step 2: verify token with GitHub
+      const userRes = await fetch('https://api.github.com/user', {
+        headers: { 'Authorization': 'Bearer '+cfg.token, 'Accept': 'application/vnd.github+json' }
+      });
+      if(userRes.ok){
+        const user = await userRes.json();
+        lines.push('2. GitHub user: ✓ ' + esc(user.login));
+      } else {
+        lines.push('2. GitHub auth: ❌ ' + userRes.status + ' — token invalid or expired');
+        resultEl.style.color = 'var(--red)';
+        resultEl.innerHTML = lines.join('<br>');
+        return;
+      }
+
+      // Step 3: check gistId
+      lines.push('3. Gist ID: ' + (cfg.gistId ? '✓ '+cfg.gistId.slice(0,16)+'…' : '❌ not set'));
+
+      // Step 4: search for Gist
+      const listRes = await fetch('https://api.github.com/gists?per_page=50', {
+        headers: { 'Authorization': 'Bearer '+cfg.token, 'Accept': 'application/vnd.github+json' }
+      });
+      if(listRes.ok){
+        const gists = await listRes.json();
+        const found = gists.find(function(g){ return g.files && g.files[SYNC_FILE]; });
+        if(found){
+          lines.push('4. Gist found: ✓ ' + found.id.slice(0,16)+'…');
+          if(!cfg.gistId){
+            cfg.gistId = found.id; saveSyncCfg(cfg);
+            lines.push('   → GistID saved! Tap Pull now.');
+          }
+        } else {
+          lines.push('4. Gist search: no TenderTrack Gist found (need to Push first from main device)');
+        }
+      } else {
+        lines.push('4. Gist list: ❌ ' + listRes.status);
+      }
+
+      resultEl.style.color = 'var(--green)';
+      resultEl.innerHTML = lines.join('<br>');
+    } catch(e){
+      lines.push('❌ Error: ' + e.message);
+      resultEl.style.color = 'var(--red)';
+      resultEl.innerHTML = lines.join('<br>');
+    }
+  });
   wire('sp-force-pull', function(){
     if(!confirm('This will REPLACE all your local tenders with the Gist data. Any unsynced local changes will be lost. Continue?')) return;
     closeM('modal-sync');
