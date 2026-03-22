@@ -923,6 +923,7 @@ function saveFollowUp(){
   // Rebuild actions modal if it's already open
   const ma = document.getElementById('modal-actions');
   if(ma && ma.classList.contains('open')) buildActionsModal();
+  schedulePush();
 }
 
 function clearFollowUp(){
@@ -935,6 +936,7 @@ function clearFollowUp(){
   render(); refreshBadge();
   const ma = document.getElementById('modal-actions');
   if(ma && ma.classList.contains('open')) buildActionsModal();
+  schedulePush();
 }
 
 // ── STORAGE ───────────────────────────────────────────
@@ -999,6 +1001,7 @@ function snoozeItem(snoozeKey){
   // If actions modal open, rebuild it
   const m = document.getElementById('modal-actions');
   if(m && m.classList.contains('open')) buildActionsModal();
+  schedulePush();
 }
 
 // ── FILTER ────────────────────────────────────────────
@@ -1309,6 +1312,7 @@ function addPerson(){
   setNewPersonRole('officer');
   renderPeopleList();
   render();
+  schedulePush();
   toast(name+' added ✓');
 }
 
@@ -1326,6 +1330,7 @@ function deletePerson(pid){
     // Keep history entries but we leave them as-is (person name shown as "Removed user")
   });
   save(); renderPeopleList(); render();
+  schedulePush();
   toast('Removed');
 }
 
@@ -2269,6 +2274,7 @@ function removeStageDetail(id, sid){
   if(t.stages.length <= 1){ toast('Cannot remove last stage', true); return; }
   t.stages = t.stages.filter(function(s){ return s!==sid; });
   if(t.stageEnteredAt) delete t.stageEnteredAt[sid];
+  t.updatedAt = Date.now();
   // Preserve stageAssigned[sid] and stageAssignHistory[sid] intentionally
   save(); render();
   // Refresh just the stages section inside the open detail modal
@@ -2510,8 +2516,19 @@ async function findOrCreateGistId(){
   const cfg = getSyncCfg();
   if(!cfg.token) return null;
   if(cfg.gistId) return cfg.gistId;
+
+  // Check if EMDTrack already saved a gistId on this device — reuse same Gist
   try{
-    // List user's gists and find the TenderTrack one
+    const emdCfg = JSON.parse(localStorage.getItem('emd_sync_cfg')||'{}');
+    if(emdCfg.gistId){
+      cfg.gistId = emdCfg.gistId;
+      saveSyncCfg(cfg);
+      return cfg.gistId;
+    }
+  } catch(e){}
+
+  // Search Gists for tendertrack-data.json OR emdtrack-data.json
+  try{
     const res = await fetch('https://api.github.com/gists?per_page=50', {
       headers: {
         'Authorization': 'Bearer ' + cfg.token,
@@ -2522,12 +2539,11 @@ async function findOrCreateGistId(){
     if(!res.ok) return null;
     const gists = await res.json();
     const found = gists.find(function(g){
-      return g.files && g.files[SYNC_FILE];
+      return g.files && (g.files[SYNC_FILE] || g.files['emdtrack-data.json']);
     });
     if(found){
       cfg.gistId = found.id;
       saveSyncCfg(cfg);
-      console.log('Found existing Gist:', cfg.gistId);
       return cfg.gistId;
     }
   } catch(e){ console.warn('findGist error:', e); }
