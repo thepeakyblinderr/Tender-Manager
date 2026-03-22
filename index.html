@@ -2512,281 +2512,153 @@ function schedulePush(){
 }
 
 // ── Find existing Gist by name (for new devices) ──────
+// ── Gist ID discovery ────────────────────────────────
 async function findOrCreateGistId(){
   const cfg = getSyncCfg();
   if(!cfg.token) return null;
   if(cfg.gistId) return cfg.gistId;
-
-  // Check if EMDTrack already saved a gistId on this device — reuse same Gist
+  // Check EMD's saved gistId first (same Gist shared)
   try{
-    const emdCfg = JSON.parse(localStorage.getItem('emd_sync_cfg')||'{}');
-    if(emdCfg.gistId){
-      cfg.gistId = emdCfg.gistId;
-      saveSyncCfg(cfg);
-      return cfg.gistId;
-    }
-  } catch(e){}
-
-  // Search Gists for tendertrack-data.json OR emdtrack-data.json
+    const emd = JSON.parse(localStorage.getItem('emd_sync_cfg')||'{}');
+    if(emd.gistId){ cfg.gistId=emd.gistId; saveSyncCfg(cfg); return cfg.gistId; }
+  }catch(e){}
+  // Search GitHub
   try{
-    const res = await fetch('https://api.github.com/gists?per_page=50', {
-      headers: {
-        'Authorization': 'Bearer ' + cfg.token,
-        'Accept': 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28'
-      }
+    const r = await fetch('https://api.github.com/gists?per_page=50',{
+      headers:{'Authorization':'Bearer '+cfg.token,'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
     });
-    if(!res.ok) return null;
-    const gists = await res.json();
-    const found = gists.find(function(g){
-      return g.files && (g.files[SYNC_FILE] || g.files['emdtrack-data.json']);
-    });
-    if(found){
-      cfg.gistId = found.id;
-      saveSyncCfg(cfg);
-      return cfg.gistId;
-    }
-  } catch(e){ console.warn('findGist error:', e); }
+    if(!r.ok) return null;
+    const list = await r.json();
+    const found = list.find(function(g){ return g.files&&(g.files[SYNC_FILE]||g.files['emdtrack-data.json']); });
+    if(found){ cfg.gistId=found.id; saveSyncCfg(cfg); return cfg.gistId; }
+  }catch(e){ console.warn('findGist:',e); }
   return null;
 }
 
+// ── Push (merge-first) ────────────────────────────────
 async function syncPush(silent){
   const cfg = getSyncCfg();
-  if(!cfg.token){ if(!silent) toast('Set up sync first', true); return; }
+  if(!cfg.token){ if(!silent) toast('Set up sync first',true); return; }
 
-  // First-time push (no gistId) — just create the Gist
+  // No Gist yet — create one
   if(!cfg.gistId){
     setSyncDot('busy');
     try{
-      const files = {};
-      files[SYNC_FILE] = { content: JSON.stringify({ tenders: buildSlim(), people: getPeople(), deleted: JSON.parse(localStorage.getItem('tt_deleted')||'{}') }) };
-      const res = await gistReq('POST', '/gists', {
-        description: 'TenderTrack data — do not edit manually',
-        public: false, files: files
-      });
-      cfg.gistId = res.id;
-      saveSyncCfg(cfg);
-      localStorage.setItem('tt_last_sync', Date.now().toString());
-      setSyncDot('ok');
-      if(!silent) toast('Pushed to Gist ✓');
-    } catch(e){
-      setSyncDot('err');
-      if(!silent) toast('Push failed: ' + e.message, true);
-      console.warn('syncPush:', e);
-    }
+      const files={}; files[SYNC_FILE]={content:JSON.stringify({tenders:buildSlim(),people:getPeople(),deleted:JSON.parse(localStorage.getItem('tt_deleted')||'{}')})};
+      const res = await gistReq('POST','/gists',{description:'TenderTrack data',public:false,files:files});
+      cfg.gistId=res.id; saveSyncCfg(cfg);
+      localStorage.setItem('tt_last_sync',Date.now().toString());
+      setSyncDot('ok'); if(!silent) toast('Pushed ✓');
+    }catch(e){ setSyncDot('err'); if(!silent) toast('Push failed: '+e.message,true); console.warn(e); }
     return;
   }
 
-  // Merge-push: read remote → merge by updatedAt → write back
+  // Merge-push
   setSyncDot('busy');
   try{
-    // 1. Fetch current remote
-    const res  = await gistReq('GET', '/gists/' + cfg.gistId);
-    const file = res.files && res.files[SYNC_FILE];
-    let remoteTenders = [], remotePeople = [], remoteDeleted = {};
-    if(file){
-      let raw = file.content;
-      if(file.truncated){ const r = await fetch(file.raw_url); raw = await r.text(); }
-      const parsed = JSON.parse(raw);
-      if(Array.isArray(parsed)){
-        remoteTenders = parsed.map(expandSlim);
-      } else if(parsed && Array.isArray(parsed.tenders)){
-        remoteTenders = parsed.tenders.map(expandSlim);
-        remotePeople  = parsed.people || [];
-        remoteDeleted = parsed.deleted || {};
-      }
-    }
-
-    // 2. Merge tenders — respecting deletions from both sides
-    // Combine deleted maps: local + remote
     const localDeleted = JSON.parse(localStorage.getItem('tt_deleted')||'{}');
-    const allDeleted = Object.assign({}, remoteDeleted, localDeleted);
-    // Save merged deletions locally
-    localStorage.setItem('tt_deleted', JSON.stringify(allDeleted));
-
-    function getEffectiveTime(t){
-      if(t.updatedAt && t.updatedAt > 0) return t.updatedAt;
-      const sea = t.stageEnteredAt || {};
-      const times = Object.values(sea).filter(function(v){ return v > 0; });
-      return times.length ? Math.max.apply(null, times) : 0;
+    // Read remote
+    const res  = await gistReq('GET','/gists/'+cfg.gistId);
+    const file = res.files && res.files[SYNC_FILE];
+    let remoteTenders=[], remotePeople=[], remoteDeleted={};
+    if(file){
+      let raw=file.content;
+      if(file.truncated){ const r2=await fetch(file.raw_url); raw=await r2.text(); }
+      try{
+        const p=JSON.parse(raw);
+        if(Array.isArray(p)){ remoteTenders=p.map(expandSlim); }
+        else if(p&&Array.isArray(p.tenders)){ remoteTenders=p.tenders.map(expandSlim); remotePeople=p.people||[]; remoteDeleted=p.deleted||{}; }
+      }catch(e){}
     }
-
-    const mergedMap = {};
-
-    // Start with remote (excluding anything in allDeleted)
-    remoteTenders.forEach(function(t){
-      if(!allDeleted[t.id]) mergedMap[t.id] = t;
-    });
-
-    // Override/add local tenders (excluding deleted)
-    tenders.forEach(function(t){
-      if(allDeleted[t.id]) return; // skip deleted
-      const remote = mergedMap[t.id];
-      if(!remote){
-        mergedMap[t.id] = t; // new local tender
-      } else {
-        const localTime  = getEffectiveTime(t);
-        const remoteTime = getEffectiveTime(remote);
-        if(localTime > remoteTime) mergedMap[t.id] = t; // local is newer
-      }
-    });
-
-    const merged = Object.values(mergedMap);
-    merged.sort(function(a,b){ return getEffectiveTime(b) - getEffectiveTime(a); });
-
-    // 3. Merge people
-    const peopleMap = {};
-    getPeople().forEach(function(p){ peopleMap[p.id] = p; });
-    remotePeople.forEach(function(p){
-      if(!peopleMap[p.id]) peopleMap[p.id] = p;
-    });
-    const mergedPeople = Object.values(peopleMap);
-
-    // 4. Update local with merged data
-    tenders = merged;
-    save();
-    savePeople(mergedPeople);
-    render();
-
-    // 5. Write merged data back to Gist
-    const files = {};
-    files[SYNC_FILE] = { content: JSON.stringify({ tenders: buildSlim(), people: mergedPeople, deleted: allDeleted }) };
-    await gistReq('PATCH', '/gists/' + cfg.gistId, { files: files });
-
-    localStorage.setItem('tt_last_sync', Date.now().toString());
-    setSyncDot('ok');
-    if(!silent) toast('Synced ✓');
-  } catch(e){
-    setSyncDot('err');
-    if(!silent) toast('Sync failed: ' + e.message, true);
-    console.warn('syncPush:', e);
-  }
+    // Merge deletions
+    const allDeleted=Object.assign({},remoteDeleted,localDeleted);
+    localStorage.setItem('tt_deleted',JSON.stringify(allDeleted));
+    // Merge tenders
+    function ts(t){ if(t.updatedAt&&t.updatedAt>0) return t.updatedAt; const v=Object.values(t.stageEnteredAt||{}).filter(function(x){return x>0;}); return v.length?Math.max.apply(null,v):0; }
+    const map={};
+    remoteTenders.forEach(function(t){ if(!allDeleted[t.id]) map[t.id]=t; });
+    tenders.forEach(function(t){ if(allDeleted[t.id]) return; const r=map[t.id]; if(!r||ts(t)>ts(r)) map[t.id]=t; });
+    const merged=Object.values(map); merged.sort(function(a,b){return ts(b)-ts(a);});
+    // Merge people
+    const pm={}; getPeople().forEach(function(p){pm[p.id]=p;}); remotePeople.forEach(function(p){if(!pm[p.id])pm[p.id]=p;});
+    const mergedPeople=Object.values(pm);
+    tenders=merged; save(); savePeople(mergedPeople); render();
+    // Write back
+    const files2={}; files2[SYNC_FILE]={content:JSON.stringify({tenders:buildSlim(),people:mergedPeople,deleted:allDeleted})};
+    await gistReq('PATCH','/gists/'+cfg.gistId,{files:files2});
+    localStorage.setItem('tt_last_sync',Date.now().toString());
+    setSyncDot('ok'); if(!silent) toast('Synced ✓');
+  }catch(e){ setSyncDot('err'); if(!silent) toast('Sync failed: '+e.message,true); console.warn(e); }
 }
 
+// ── Pull ──────────────────────────────────────────────
 async function syncPull(silent){
   const cfg = getSyncCfg();
   if(!cfg.token) return;
-  if(!cfg.gistId){ if(!silent) toast('Push first to create the Gist', true); return; }
+  if(!cfg.gistId){ if(!silent) toast('Push first to create the Gist',true); return; }
   setSyncDot('busy');
   try{
-    const res  = await gistReq('GET', '/gists/' + cfg.gistId);
+    const res  = await gistReq('GET','/gists/'+cfg.gistId);
     const file = res.files && res.files[SYNC_FILE];
-    if(!file) throw new Error('Data file not found in Gist');
-    let raw = file.content;
-    if(file.truncated){
-      const r = await fetch(file.raw_url);
-      raw = await r.text();
+    if(!file){
+      // File not in Gist yet — push to create it
+      setSyncDot('ok'); syncPush(silent); return;
     }
-    const parsed = JSON.parse(raw);
-    let arr, peopleArr, remoteDeleted2 = {};
-    if(Array.isArray(parsed)){
-      arr = parsed; peopleArr = null;
-    } else if(parsed && Array.isArray(parsed.tenders)){
-      arr = parsed.tenders; peopleArr = parsed.people || null;
-      remoteDeleted2 = parsed.deleted || {};
-    } else {
-      throw new Error('Invalid data format in Gist');
-    }
-    // Merge deleted maps and filter
-    const localDel = JSON.parse(localStorage.getItem('tt_deleted')||'{}');
-    const mergedDel = Object.assign({}, localDel, remoteDeleted2);
-    localStorage.setItem('tt_deleted', JSON.stringify(mergedDel));
-    // Filter out deleted tenders from pull
-    const filteredArr = arr.filter(function(t){ return !mergedDel[t.id]; });
-
-    if(filteredArr.length > 0 || peopleArr){
-      if(filteredArr.length > 0 || arr.length > 0){
-        tenders = filteredArr.map(expandSlim);
-        save();
-      }
-      if(peopleArr && peopleArr.length > 0){
-        savePeople(peopleArr);
-      }
+    let raw=file.content;
+    if(file.truncated){ const r2=await fetch(file.raw_url); raw=await r2.text(); }
+    const localDeleted=JSON.parse(localStorage.getItem('tt_deleted')||'{}');
+    let arr=[],peopleArr=null,remoteDeleted={};
+    try{
+      const p=JSON.parse(raw);
+      if(Array.isArray(p)){ arr=p; }
+      else if(p&&Array.isArray(p.tenders)){ arr=p.tenders; peopleArr=p.people||null; remoteDeleted=p.deleted||{}; }
+    }catch(e){ throw new Error('Invalid data in Gist'); }
+    const allDeleted=Object.assign({},localDeleted,remoteDeleted);
+    localStorage.setItem('tt_deleted',JSON.stringify(allDeleted));
+    const filtered=arr.filter(function(t){return !allDeleted[t.id];});
+    if(filtered.length>0||peopleArr){
+      tenders=filtered.map(expandSlim); save();
+      if(peopleArr&&peopleArr.length>0) savePeople(peopleArr);
       render();
-      localStorage.setItem('tt_last_sync', Date.now().toString());
-      setSyncDot('ok');
-      if(!silent) toast('Pulled ' + filteredArr.length + ' tenders ✓');
+      localStorage.setItem('tt_last_sync',Date.now().toString());
+      setSyncDot('ok'); if(!silent) toast('Pulled '+filtered.length+' tenders ✓');
     } else {
-      setSyncDot('ok');
-      if(!silent) toast('Gist is empty — Push from your main device first');
+      setSyncDot('ok'); if(!silent) toast('Nothing to pull');
     }
-  } catch(e){
-    setSyncDot('err');
-    if(!silent) toast('Pull failed: ' + e.message, true);
-    console.warn('syncPull:', e);
-  }
-}
-
-// ── Force Pull (replaces all local data with Gist) ───
-async function syncForcePull(){
-  const cfg = getSyncCfg();
-  if(!cfg.token || !cfg.gistId){ toast('Not connected', true); return; }
-  setSyncDot('busy');
-  try{
-    const res  = await gistReq('GET', '/gists/' + cfg.gistId);
-    const file = res.files && res.files[SYNC_FILE];
-    if(!file) throw new Error('Data file not found in Gist');
-    let raw = file.content;
-    if(file.truncated){ const r = await fetch(file.raw_url); raw = await r.text(); }
-    const parsed = JSON.parse(raw);
-    let arr, peopleArr;
-    if(Array.isArray(parsed)){
-      arr = parsed; peopleArr = null;
-    } else if(parsed && Array.isArray(parsed.tenders)){
-      arr = parsed.tenders; peopleArr = parsed.people || null;
-    } else {
-      throw new Error('Invalid data format');
-    }
-    tenders = arr.map(expandSlim);
-    save();
-    if(peopleArr && peopleArr.length > 0) savePeople(peopleArr);
-    render();
-    localStorage.setItem('tt_last_sync', Date.now().toString());
-    setSyncDot('ok');
-    toast('Force pulled ' + tenders.length + ' tenders ✓');
-  } catch(e){
-    setSyncDot('err');
-    toast('Force pull failed: ' + e.message, true);
-    console.warn('syncForcePull:', e);
-  }
+  }catch(e){ setSyncDot('err'); if(!silent) toast('Pull failed: '+e.message,true); console.warn(e); }
 }
 
 // ── Export / Import ───────────────────────────────────
 function exportData(){
-  const payload = { tenders: buildSlim(), people: getPeople(), deleted: JSON.parse(localStorage.getItem('tt_deleted')||'{}') };
-  const data = JSON.stringify(payload, null, 2);
-  const blob = new Blob([data], {type:'application/json'});
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  a.href = url;
-  a.download = 'tendertrack-' + new Date().toISOString().slice(0,10) + '.json';
-  document.body.appendChild(a); a.click();
-  document.body.removeChild(a); URL.revokeObjectURL(url);
+  const payload={tenders:buildSlim(),people:getPeople(),deleted:JSON.parse(localStorage.getItem('tt_deleted')||'{}')};
+  const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url; a.download='tendertrack-'+new Date().toISOString().slice(0,10)+'.json';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
   toast('Exported ✓');
 }
 
 function importData(){
-  const input = document.createElement('input');
-  input.type = 'file'; input.accept = '.json';
-  input.addEventListener('change', function(){
-    const file = input.files[0]; if(!file) return;
-    const reader = new FileReader();
-    reader.onload = function(ev){
+  const input=document.createElement('input'); input.type='file'; input.accept='.json';
+  input.addEventListener('change',function(){
+    const file=input.files[0]; if(!file) return;
+    const reader=new FileReader();
+    reader.onload=function(ev){
       try{
-        const arr = JSON.parse(ev.target.result);
-        if(!Array.isArray(arr)) throw new Error('Not a valid export file');
-        if(tenders.length > 0 && !confirm('Replace all ' + tenders.length + ' tenders with imported data?')) return;
-        tenders = arr.map(expandSlim);
-        save(); render();
-        toast('Imported ' + tenders.length + ' tenders ✓');
-      } catch(err){ toast('Import failed: ' + err.message, true); }
+        const p=JSON.parse(ev.target.result);
+        const arr=Array.isArray(p)?p:(p&&Array.isArray(p.tenders)?p.tenders:null);
+        if(!arr) throw new Error('Not a valid export file');
+        if(tenders.length>0&&!confirm('Replace all '+tenders.length+' tenders with imported data?')) return;
+        tenders=arr.map(expandSlim); save(); render();
+        toast('Imported '+tenders.length+' tenders ✓');
+      }catch(err){ toast('Import failed: '+err.message,true); }
     };
     reader.readAsText(file);
   });
   input.click();
 }
 
-// ── One-time migration from old Google Sheets sync ───
 
 // ── Sync modal ────────────────────────────────────────
 function openSync(){
