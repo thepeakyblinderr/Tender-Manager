@@ -404,18 +404,17 @@ async function findOrCreateGistId(){
   if(!cfg.token) return null;
   if(cfg.gistId) return cfg.gistId;
 
-  // First check if TenderTrack already saved a gistId — reuse the same Gist
+  // Synchronously check TenderTrack's saved gistId first — fastest path
   try{
     const ttCfg = JSON.parse(localStorage.getItem('tt_sync_cfg')||'{}');
     if(ttCfg.gistId){
       cfg.gistId = ttCfg.gistId;
       saveSyncCfg(cfg);
-      console.log('Reusing TenderTrack Gist:', cfg.gistId);
       return cfg.gistId;
     }
   } catch(e){}
 
-  // Search Gists for emdtrack-data.json OR tendertrack-data.json (same Gist)
+  // Search Gists for emdtrack-data.json OR tendertrack-data.json
   try{
     const res = await fetch('https://api.github.com/gists?per_page=50', {
       headers: {
@@ -971,6 +970,22 @@ function exportExcel(){
 
 // -- INIT -------------------------------------------------------
 load();
+
+// Immediately copy gistId from TenderTrack if EMD doesn't have one
+(function(){
+  try{
+    const emdCfg = JSON.parse(localStorage.getItem('emd_sync_cfg')||'{}');
+    if(emdCfg.token && !emdCfg.gistId){
+      const ttCfg = JSON.parse(localStorage.getItem('tt_sync_cfg')||'{}');
+      if(ttCfg.gistId){
+        emdCfg.gistId = ttCfg.gistId;
+        localStorage.setItem('emd_sync_cfg', JSON.stringify(emdCfg));
+        console.log('EMD: copied gistId from TenderTrack:', ttCfg.gistId);
+      }
+    }
+  } catch(e){}
+})();
+
 const _emdCfg = getSyncCfg();
 setSyncDot(_emdCfg.token ? 'ok' : '');
 if(_emdCfg.token){
