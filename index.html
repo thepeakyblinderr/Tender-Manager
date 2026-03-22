@@ -2568,30 +2568,48 @@ async function syncPush(silent){
       }
     }
 
-    // 2. Merge tenders — winner = highest updatedAt
+    // 2. Merge tenders
+    // For tenders with no updatedAt, derive a timestamp from stageEnteredAt
+    // (most recent stage entry = proxy for last modification)
+    function getEffectiveTime(t){
+      if(t.updatedAt && t.updatedAt > 0) return t.updatedAt;
+      const sea = t.stageEnteredAt || {};
+      const times = Object.values(sea).filter(function(v){ return v > 0; });
+      return times.length ? Math.max.apply(null, times) : 0;
+    }
+
+    const lastSync = parseInt(localStorage.getItem('tt_last_sync') || '0');
     const mergedMap = {};
-    // Add all remote tenders first
+
+    // Start with remote
     remoteTenders.forEach(function(t){ mergedMap[t.id] = t; });
-    // Override with local if local is newer or same age (local changes take priority)
+
+    // Override with local ONLY if local is strictly newer than remote
+    // If same age: prefer remote (it may have been updated by someone else since last sync)
     tenders.forEach(function(t){
       const remote = mergedMap[t.id];
-      if(!remote || (t.updatedAt || 0) >= (remote.updatedAt || 0)){
+      if(!remote){
+        // New local tender not on remote — keep it
         mergedMap[t.id] = t;
+      } else {
+        const localTime  = getEffectiveTime(t);
+        const remoteTime = getEffectiveTime(remote);
+        if(localTime > remoteTime){
+          // Local is strictly newer — local wins
+          mergedMap[t.id] = t;
+        }
+        // Otherwise remote wins (either remote is newer, or both are 0 — trust remote)
       }
     });
-    // Also keep remote-only tenders (added by someone else)
-    // already in mergedMap from step above
 
     const merged = Object.values(mergedMap);
-    // Sort by most recently updated
-    merged.sort(function(a,b){ return (b.updatedAt||0) - (a.updatedAt||0); });
+    merged.sort(function(a,b){ return getEffectiveTime(b) - getEffectiveTime(a); });
 
-    // 3. Merge people — combine, remote wins on role conflicts
+    // 3. Merge people
     const peopleMap = {};
     getPeople().forEach(function(p){ peopleMap[p.id] = p; });
     remotePeople.forEach(function(p){
-      if(!peopleMap[p.id]) peopleMap[p.id] = p; // add remote-only people
-      // If person exists locally keep local (officer knows their own team)
+      if(!peopleMap[p.id]) peopleMap[p.id] = p;
     });
     const mergedPeople = Object.values(peopleMap);
 
@@ -2664,6 +2682,40 @@ async function syncPull(silent){
   }
 }
 
+// ── Force Pull (replaces all local data with Gist) ───
+async function syncForcePull(){
+  const cfg = getSyncCfg();
+  if(!cfg.token || !cfg.gistId){ toast('Not connected', true); return; }
+  setSyncDot('busy');
+  try{
+    const res  = await gistReq('GET', '/gists/' + cfg.gistId);
+    const file = res.files && res.files[SYNC_FILE];
+    if(!file) throw new Error('Data file not found in Gist');
+    let raw = file.content;
+    if(file.truncated){ const r = await fetch(file.raw_url); raw = await r.text(); }
+    const parsed = JSON.parse(raw);
+    let arr, peopleArr;
+    if(Array.isArray(parsed)){
+      arr = parsed; peopleArr = null;
+    } else if(parsed && Array.isArray(parsed.tenders)){
+      arr = parsed.tenders; peopleArr = parsed.people || null;
+    } else {
+      throw new Error('Invalid data format');
+    }
+    tenders = arr.map(expandSlim);
+    save();
+    if(peopleArr && peopleArr.length > 0) savePeople(peopleArr);
+    render();
+    localStorage.setItem('tt_last_sync', Date.now().toString());
+    setSyncDot('ok');
+    toast('Force pulled ' + tenders.length + ' tenders ✓');
+  } catch(e){
+    setSyncDot('err');
+    toast('Force pull failed: ' + e.message, true);
+    console.warn('syncForcePull:', e);
+  }
+}
+
 // ── Export / Import ───────────────────────────────────
 function exportData(){
   const payload = { tenders: buildSlim(), people: getPeople() };
@@ -2727,6 +2779,9 @@ function openSync(){
       '<div class="sync-acts">'+
         '<button class="btn-push" id="sp-push">⬆ Push to Gist</button>'+
         '<button class="btn-pull" id="sp-pull">⬇ Pull from Gist</button>'+
+        '</div>'+
+        '<div style="margin-bottom:12px;">'+
+        '<button id="sp-force-pull" style="width:100%;padding:9px;border-radius:9px;font-size:12px;font-weight:700;cursor:pointer;font-family:var(--mono);background:var(--card2);color:var(--yellow);border:1px solid rgba(180,83,9,.3);">⚠ Force Pull — replace ALL local data with Gist</button>'+
       '</div>'+
       '<div class="fsec">Export / Import (no account needed)</div>'+
       '<div class="sync-acts">'+
@@ -2789,6 +2844,11 @@ function openSync(){
 
   wire('sp-push',   function(){ closeM('modal-sync'); syncPush(); });
   wire('sp-pull',   function(){ closeM('modal-sync'); syncPull(); });
+  wire('sp-force-pull', function(){
+    if(!confirm('This will REPLACE all your local tenders with the Gist data. Any unsynced local changes will be lost. Continue?')) return;
+    closeM('modal-sync');
+    syncForcePull();
+  });
   wire('sp-export', exportData);
   wire('sp-import', importData);
 
