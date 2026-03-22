@@ -399,125 +399,95 @@ async function gistReq(method, path, body){
   return res.status === 204 ? {} : res.json();
 }
 
+// ── Gist ID discovery ────────────────────────────────
 async function findOrCreateGistId(){
   const cfg = getSyncCfg();
   if(!cfg.token) return null;
   if(cfg.gistId) return cfg.gistId;
-
-  // Synchronously check TenderTrack's saved gistId first — fastest path
+  // Check TenderTrack's saved gistId (same Gist shared)
   try{
-    const ttCfg = JSON.parse(localStorage.getItem('tt_sync_cfg')||'{}');
-    if(ttCfg.gistId){
-      cfg.gistId = ttCfg.gistId;
-      saveSyncCfg(cfg);
-      return cfg.gistId;
-    }
-  } catch(e){}
-
-  // Search Gists for emdtrack-data.json OR tendertrack-data.json
+    const tt=JSON.parse(localStorage.getItem('tt_sync_cfg')||'{}');
+    if(tt.gistId){ cfg.gistId=tt.gistId; saveSyncCfg(cfg); return cfg.gistId; }
+  }catch(e){}
+  // Search GitHub
   try{
-    const res = await fetch('https://api.github.com/gists?per_page=50', {
-      headers: {
-        'Authorization': 'Bearer ' + cfg.token,
-        'Accept': 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28'
-      }
+    const r=await fetch('https://api.github.com/gists?per_page=50',{
+      headers:{'Authorization':'Bearer '+cfg.token,'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
     });
-    if(!res.ok) return null;
-    const gists = await res.json();
-    const found = gists.find(function(g){
-      return g.files && (g.files[EMD_SYNC_FILE] || g.files['tendertrack-data.json']);
-    });
-    if(found){
-      cfg.gistId = found.id;
-      saveSyncCfg(cfg);
-      return cfg.gistId;
-    }
-  } catch(e){ console.warn('findGist error:', e); }
+    if(!r.ok) return null;
+    const list=await r.json();
+    const found=list.find(function(g){return g.files&&(g.files[EMD_SYNC_FILE]||g.files['tendertrack-data.json']);});
+    if(found){ cfg.gistId=found.id; saveSyncCfg(cfg); return cfg.gistId; }
+  }catch(e){ console.warn('findGist:',e); }
   return null;
 }
 
+// ── Push ──────────────────────────────────────────────
 async function syncPush(silent){
-  const cfg = getSyncCfg();
-  if(!cfg.token){ if(!silent) toast('Set up sync first', true); return; }
-
-  // First push — just create gist
+  const cfg=getSyncCfg();
+  if(!cfg.token){ if(!silent) toast('Set up sync first',true); return; }
+  // No Gist yet — create one
   if(!cfg.gistId){
     setSyncDot('busy');
     try{
-      const files = {};
-      files[EMD_SYNC_FILE] = { content: JSON.stringify(tenders) };
-      const res = await gistReq('POST', '/gists', { description: 'EMDTrack data', public: false, files: files });
-      cfg.gistId = res.id; saveSyncCfg(cfg);
-      localStorage.setItem('emd_last_sync', Date.now().toString());
-      setSyncDot('ok'); if(!silent) toast('Pushed to Gist \u2713');
-    } catch(e){ setSyncDot('err'); if(!silent) toast('Push failed: '+e.message, true); }
+      const files={}; files[EMD_SYNC_FILE]={content:JSON.stringify(tenders)};
+      const res=await gistReq('POST','/gists',{description:'TenderTrack+EMDTrack data',public:false,files:files});
+      cfg.gistId=res.id; saveSyncCfg(cfg);
+      localStorage.setItem('emd_last_sync',Date.now().toString());
+      setSyncDot('ok'); if(!silent) toast('Pushed ✓');
+    }catch(e){ setSyncDot('err'); if(!silent) toast('Push failed: '+e.message,true); }
     return;
   }
-
-  // Merge-push: read remote, merge by tender id, write back
+  // Merge-push
   setSyncDot('busy');
   try{
-    const res  = await gistReq('GET', '/gists/' + cfg.gistId);
-    const file = res.files && res.files[EMD_SYNC_FILE];
-    let remoteTenders = [];
+    const emdDeleted=JSON.parse(localStorage.getItem('emd_deleted')||'{}');
+    const res=await gistReq('GET','/gists/'+cfg.gistId);
+    const file=res.files&&res.files[EMD_SYNC_FILE];
+    let remote=[];
     if(file){
-      let raw = file.content;
-      if(file.truncated){ const r2 = await fetch(file.raw_url); raw = await r2.text(); }
-      const parsed = JSON.parse(raw);
-      if(Array.isArray(parsed)) remoteTenders = parsed;
+      let raw=file.content;
+      if(file.truncated){ const r2=await fetch(file.raw_url); raw=await r2.text(); }
+      try{ const p=JSON.parse(raw); if(Array.isArray(p)) remote=p; }catch(e){}
     }
-    // Merge: local wins for existing tenders, keep remote-only tenders
-    const emdDeleted = JSON.parse(localStorage.getItem('emd_deleted')||'{}');
-    const map = {};
-    remoteTenders.forEach(function(t){ if(!emdDeleted[t.id]) map[t.id] = t; });
-    tenders.forEach(function(t){ if(!emdDeleted[t.id]) map[t.id] = t; }); // local always wins
-    const merged = Object.values(map);
-    tenders = merged; save(); render();
-    const files2 = {};
-    files2[EMD_SYNC_FILE] = { content: JSON.stringify(merged) };
-    await gistReq('PATCH', '/gists/' + cfg.gistId, { files: files2 });
-    localStorage.setItem('emd_last_sync', Date.now().toString());
-    setSyncDot('ok'); if(!silent) toast('Synced \u2713');
-  } catch(e){ setSyncDot('err'); if(!silent) toast('Sync failed: '+e.message, true); }
+    // Merge: local always wins for existing tenders, keep remote-only
+    const map={};
+    remote.forEach(function(t){ if(!emdDeleted[t.id]) map[t.id]=t; });
+    tenders.forEach(function(t){ if(!emdDeleted[t.id]) map[t.id]=t; });
+    const merged=Object.values(map);
+    tenders=merged; save(); render();
+    const files2={}; files2[EMD_SYNC_FILE]={content:JSON.stringify(merged)};
+    await gistReq('PATCH','/gists/'+cfg.gistId,{files:files2});
+    localStorage.setItem('emd_last_sync',Date.now().toString());
+    setSyncDot('ok'); if(!silent) toast('Synced ✓');
+  }catch(e){ setSyncDot('err'); if(!silent) toast('Sync failed: '+e.message,true); console.warn(e); }
 }
 
+// ── Pull ──────────────────────────────────────────────
 async function syncPull(silent){
-  const cfg = getSyncCfg();
+  const cfg=getSyncCfg();
   if(!cfg.token) return;
-  if(!cfg.gistId){ if(!silent) toast('Push first to create the Gist', true); return; }
+  if(!cfg.gistId){ if(!silent) toast('Push first',true); return; }
   setSyncDot('busy');
   try{
-    const res  = await gistReq('GET', '/gists/' + cfg.gistId);
-    const file = res.files && res.files[EMD_SYNC_FILE];
+    const res=await gistReq('GET','/gists/'+cfg.gistId);
+    const file=res.files&&res.files[EMD_SYNC_FILE];
     if(!file){
-      // EMD file doesn't exist in Gist yet — push to create it
-      setSyncDot('ok');
-      if(!silent) toast('Creating EMD data in Gist…');
-      syncPush(true);
-      return;
+      // EMD file not in Gist yet — push to create it
+      setSyncDot('ok'); syncPush(silent); return;
     }
-    let raw = file.content;
-    if(file.truncated){ const r = await fetch(file.raw_url); raw = await r.text(); }
-    const arr = JSON.parse(raw);
-    if(Array.isArray(arr)){
-      if(arr.length > 0){
-        tenders = arr; save(); render();
-        localStorage.setItem('emd_last_sync', Date.now().toString());
-        setSyncDot('ok');
-        if(!silent) toast('Pulled ' + arr.length + ' entries \u2713');
-      } else {
-        setSyncDot('ok');
-        if(!silent) toast('No EMD entries yet');
-      }
-    } else {
-      throw new Error('Invalid data format in Gist');
-    }
-  } catch(e){
-    setSyncDot('err');
-    if(!silent) toast('Pull failed: ' + e.message, true);
-  }
+    let raw=file.content;
+    if(file.truncated){ const r2=await fetch(file.raw_url); raw=await r2.text(); }
+    const emdDeleted=JSON.parse(localStorage.getItem('emd_deleted')||'{}');
+    let arr=[];
+    try{ const p=JSON.parse(raw); if(Array.isArray(p)) arr=p; }catch(e){ throw new Error('Invalid data in Gist'); }
+    const filtered=arr.filter(function(t){return !emdDeleted[t.id];});
+    tenders=filtered; save(); render();
+    localStorage.setItem('emd_last_sync',Date.now().toString());
+    setSyncDot('ok'); if(!silent) toast('Pulled '+filtered.length+' entries ✓');
+  }catch(e){ setSyncDot('err'); if(!silent) toast('Pull failed: '+e.message,true); console.warn(e); }
 }
+
 
 function exportData(){
   const blob = new Blob([JSON.stringify(tenders, null, 2)], {type:'application/json'});
