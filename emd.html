@@ -403,6 +403,19 @@ async function findOrCreateGistId(){
   const cfg = getSyncCfg();
   if(!cfg.token) return null;
   if(cfg.gistId) return cfg.gistId;
+
+  // First check if TenderTrack already saved a gistId — reuse the same Gist
+  try{
+    const ttCfg = JSON.parse(localStorage.getItem('tt_sync_cfg')||'{}');
+    if(ttCfg.gistId){
+      cfg.gistId = ttCfg.gistId;
+      saveSyncCfg(cfg);
+      console.log('Reusing TenderTrack Gist:', cfg.gistId);
+      return cfg.gistId;
+    }
+  } catch(e){}
+
+  // Search Gists for emdtrack-data.json OR tendertrack-data.json (same Gist)
   try{
     const res = await fetch('https://api.github.com/gists?per_page=50', {
       headers: {
@@ -413,7 +426,9 @@ async function findOrCreateGistId(){
     });
     if(!res.ok) return null;
     const gists = await res.json();
-    const found = gists.find(function(g){ return g.files && g.files[EMD_SYNC_FILE]; });
+    const found = gists.find(function(g){
+      return g.files && (g.files[EMD_SYNC_FILE] || g.files['tendertrack-data.json']);
+    });
     if(found){
       cfg.gistId = found.id;
       saveSyncCfg(cfg);
