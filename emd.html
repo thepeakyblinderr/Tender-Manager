@@ -490,7 +490,13 @@ async function syncPull(silent){
   try{
     const res  = await gistReq('GET', '/gists/' + cfg.gistId);
     const file = res.files && res.files[EMD_SYNC_FILE];
-    if(!file) throw new Error('Data file not found in Gist');
+    if(!file){
+      // EMD file doesn't exist in Gist yet — push to create it
+      setSyncDot('ok');
+      if(!silent) toast('Creating EMD data in Gist…');
+      syncPush(true);
+      return;
+    }
     let raw = file.content;
     if(file.truncated){ const r = await fetch(file.raw_url); raw = await r.text(); }
     const arr = JSON.parse(raw);
@@ -502,7 +508,7 @@ async function syncPull(silent){
         if(!silent) toast('Pulled ' + arr.length + ' entries \u2713');
       } else {
         setSyncDot('ok');
-        if(!silent) toast('Gist is empty \u2014 Push from your main device first');
+        if(!silent) toast('No EMD entries yet');
       }
     } else {
       throw new Error('Invalid data format in Gist');
