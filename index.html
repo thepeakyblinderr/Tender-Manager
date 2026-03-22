@@ -2482,20 +2482,44 @@ async function gistReq(method, path, body){
   return res.status === 204 ? {} : res.json();
 }
 
-// ── Auto-push (debounced) ─────────────────────────────
-// Waits 8s after last change before pushing — so rapid edits batch into one push
-// ── Auto-push (debounced) ─────────────────────────────
+// ── Auto-push (debounced 8s) ──────────────────────────
 let _pushTimer = null;
 function schedulePush(){
   const cfg = getSyncCfg();
-  if(!cfg.token || !cfg.gistId) return; // not configured — skip silently
+  if(!cfg.token || !cfg.gistId) return;
   clearTimeout(_pushTimer);
-  // Show subtle pending indicator — not the spinning busy state
   const dot = document.getElementById('sync-dot');
   if(dot) dot.className = 'sync-dot pending';
-  _pushTimer = setTimeout(function(){
-    syncPush(true); // silent = no toast on auto-push
-  }, 8000);
+  _pushTimer = setTimeout(function(){ syncPush(true); }, 8000);
+}
+
+// ── Find existing Gist by name (for new devices) ──────
+async function findOrCreateGistId(){
+  const cfg = getSyncCfg();
+  if(!cfg.token) return null;
+  if(cfg.gistId) return cfg.gistId;
+  try{
+    // List user's gists and find the TenderTrack one
+    const res = await fetch('https://api.github.com/gists?per_page=50', {
+      headers: {
+        'Authorization': 'Bearer ' + cfg.token,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28'
+      }
+    });
+    if(!res.ok) return null;
+    const gists = await res.json();
+    const found = gists.find(function(g){
+      return g.files && g.files[SYNC_FILE];
+    });
+    if(found){
+      cfg.gistId = found.id;
+      saveSyncCfg(cfg);
+      console.log('Found existing Gist:', cfg.gistId);
+      return cfg.gistId;
+    }
+  } catch(e){ console.warn('findGist error:', e); }
+  return null;
 }
 
 async function syncPush(silent){
@@ -2782,8 +2806,10 @@ function openSync(){
     setSyncDot('ok');
     closeM('modal-sync');
     toast('Token saved ✓');
-    if(!newCfg.gistId) syncPush();
-    else syncPull();
+    // Try to find existing Gist — if found pull, if not create via push
+    findOrCreateGistId().then(function(gistId){
+      if(gistId){ syncPull(); } else { syncPush(); }
+    });
   });
 
   wire('sp-disc', function(){
@@ -3189,7 +3215,22 @@ buildSelects();
 render();
 const _initCfg = getSyncCfg();
 setSyncDot(_initCfg.token ? 'ok' : 'idle');
-if(_initCfg.token && _initCfg.gistId) syncPull(true);
+if(_initCfg.token){
+  if(_initCfg.gistId){
+    // Already know the Gist — just pull
+    syncPull(true);
+  } else {
+    // Have token but no gistId (new device) — try to find existing Gist first
+    setSyncDot('busy');
+    findOrCreateGistId().then(function(gistId){
+      if(gistId){
+        syncPull(true); // found it — pull data
+      } else {
+        setSyncDot('ok'); // no Gist yet — first device, will be created on first push
+      }
+    });
+  }
+}
 initProfile();
 </script>
 </body>
