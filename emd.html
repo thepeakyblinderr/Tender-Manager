@@ -399,6 +399,30 @@ async function gistReq(method, path, body){
   return res.status === 204 ? {} : res.json();
 }
 
+async function findOrCreateGistId(){
+  const cfg = getSyncCfg();
+  if(!cfg.token) return null;
+  if(cfg.gistId) return cfg.gistId;
+  try{
+    const res = await fetch('https://api.github.com/gists?per_page=50', {
+      headers: {
+        'Authorization': 'Bearer ' + cfg.token,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28'
+      }
+    });
+    if(!res.ok) return null;
+    const gists = await res.json();
+    const found = gists.find(function(g){ return g.files && g.files[EMD_SYNC_FILE]; });
+    if(found){
+      cfg.gistId = found.id;
+      saveSyncCfg(cfg);
+      return cfg.gistId;
+    }
+  } catch(e){ console.warn('findGist error:', e); }
+  return null;
+}
+
 async function syncPush(silent){
   const cfg = getSyncCfg();
   if(!cfg.token){ if(!silent) toast('Set up sync first', true); return; }
@@ -554,7 +578,9 @@ function openSync(){
     const old=getSyncCfg();
     const newCfg={token:token, gistId:token===old.token?(old.gistId||''):''};
     saveSyncCfg(newCfg); setSyncDot('ok'); closeM('modal-sync'); toast('Token saved ✓');
-    if(!newCfg.gistId) syncPush(); else syncPull();
+    findOrCreateGistId().then(function(gistId){
+      if(gistId) syncPull(); else syncPush();
+    });
   });
   wire('es-disc', function(){
     const btn=document.getElementById('es-disc'); if(!btn) return;
@@ -887,7 +913,15 @@ function exportExcel(){
 load();
 const _emdCfg = getSyncCfg();
 setSyncDot(_emdCfg.token ? 'ok' : '');
-if(_emdCfg.token && _emdCfg.gistId) syncPull(true);
+if(_emdCfg.token){
+  if(_emdCfg.gistId){
+    syncPull(true);
+  } else {
+    findOrCreateGistId().then(function(gistId){
+      if(gistId) syncPull(true);
+    });
+  }
+}
 </script>
 </body>
 </html>
