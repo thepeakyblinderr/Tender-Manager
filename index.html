@@ -3229,16 +3229,18 @@ function openProfilePicker(isFirst){
     const col = ASSIGN_COLORS[people.indexOf(p) % ASSIGN_COLORS.length];
     const isCurrent = current === p.id;
     const role = p.role || 'officer';
-    const count = tenders.filter(function(t){
-      if(isManager) return true;
-      if(role === 'officer') return t.owner === p.id;
-      // assistant: count stages assigned to them
-      return tenders.some(function(td){
-        return td.stages && td.stages.some(function(sid){
-          return (td.stageAssigned||{})[sid] === p.id;
+    const count = (function(){
+      if(isManager) return tenders.length;
+      if(role === 'officer') return tenders.filter(function(t){ return t.owner === p.id; }).length;
+      // assistant: count active stages assigned to this specific person
+      var n = 0;
+      tenders.forEach(function(t){
+        (t.stages||[]).forEach(function(sid){
+          if((t.stageAssigned||{})[sid] === p.id) n++;
         });
       });
-    }).length;
+      return n;
+    })();
     const roleLabel = role === 'manager' ? '👑 Manager' : role === 'assistant' ? '🤝 Assistant' : '🧑‍💼 Officer';
     const roleBg    = role === 'manager' ? 'rgba(180,83,9,.15)' : role === 'assistant' ? 'rgba(26,86,219,.12)' : 'rgba(123,47,190,.15)';
     const roleCol   = role === 'manager' ? 'var(--yellow)' : role === 'assistant' ? 'var(--accent)' : 'var(--purple)';
